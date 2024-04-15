@@ -1,14 +1,11 @@
-import express, { Request, Response, NextFunction } from "express";
-import { ChildProcessWithoutNullStreams, spawn } from "child_process";
-import fs from "fs";
-import path from "path";
-import bodyParser from "body-parser";
 import axios from "axios";
-import https from "https";
-import os from "os";
-import { encode } from "gpt-3-encoder";
+import bodyParser from "body-parser";
 import { randomUUID } from "crypto";
 import { config } from "dotenv";
+import express, { NextFunction, Request, Response } from "express";
+import { encode } from "gpt-3-encoder";
+import { HttpsProxyAgent } from 'https-proxy-agent';
+
 
 config();
 
@@ -18,7 +15,9 @@ const baseUrl = "https://chat.openai.com";
 const apiUrl = `${baseUrl}/backend-anon/conversation`;
 const refreshInterval = 60000; // Interval to refresh token in ms
 const errorWait = 120000; // Wait time in ms after an error
-let cloudflared: ChildProcessWithoutNullStreams;
+
+
+const httpsAgent = new HttpsProxyAgent('http://localhost:1080');
 
 // Initialize global variables to store the session token and device ID
 let token: string;
@@ -66,9 +65,12 @@ async function* StreamCompletion(data: any) {
 	yield* linesToMessages(chunksToLines(data));
 }
 
+
+
 // Setup axios instance for API requests with predefined configurations
 const axiosInstance = axios.create({
-	httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+  httpAgent: httpsAgent,
+  httpsAgent: httpsAgent,
 	proxy:
 		process.env.PROXY === "true"
 			? {
@@ -327,133 +329,16 @@ app.use((req, res) =>
 	})
 );
 
-async function DownloadCloudflared(): Promise<string> {
-	const platform = os.platform();
-	let url: string;
-
-	if (platform === "win32") {
-		const arch = os.arch() === "x64" ? "amd64" : "386";
-		url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-${arch}.exe`;
-	} else {
-		let arch = os.arch();
-		switch (arch) {
-			case "x64":
-				arch = "amd64";
-				break;
-			case "arm":
-			case "arm64":
-				break;
-			default:
-				arch = "amd64"; // Default to amd64 if unknown architecture
-		}
-		const platformLower = platform.toLowerCase();
-		url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${platformLower}-${arch}`;
-	}
-
-	const fileName = platform === "win32" ? "cloudflared.exe" : "cloudflared";
-	const filePath = path.resolve(fileName);
-
-	if (fs.existsSync(filePath)) {
-		return filePath;
-	}
-
-	try {
-		const response = await axiosInstance({
-			method: "get",
-			url: url,
-			responseType: "stream",
-		});
-
-		const writer = fs.createWriteStream(filePath);
-
-		response.data.pipe(writer);
-
-		return new Promise<string>((resolve, reject) => {
-			writer.on("finish", () => {
-				if (platform !== "win32") {
-					fs.chmodSync(filePath, 0o755);
-				}
-				resolve(filePath);
-			});
-
-			writer.on("error", reject);
-		});
-	} catch (error: any) {
-		// console.error("Failed to download file:", error.message);
-		return null;
-	}
-}
-
-async function StartCloudflaredTunnel(cloudflaredPath: string): Promise<string> {
-	const localUrl = `http://localhost:${port}`;
-	return new Promise<string>((resolve, reject) => {
-		cloudflared = spawn(cloudflaredPath, ["tunnel", "--url", localUrl]);
-
-		cloudflared.stdout.on("data", (data: any) => {
-			const output = data.toString();
-			// console.log("Cloudflared Output:", output);
-
-			// Adjusted regex to specifically match URLs that end with .trycloudflare.com
-			const urlMatch = output.match(/https:\/\/[^\s]+\.trycloudflare\.com/);
-			if (urlMatch) {
-				let url = urlMatch[0];
-				resolve(url);
-			}
-		});
-
-		cloudflared.stderr.on("data", (data: any) => {
-			const output = data.toString();
-			// console.error("Error from cloudflared:", output);
-
-			const urlMatch = output.match(/https:\/\/[^\s]+\.trycloudflare\.com/);
-			if (urlMatch) {
-				let url = urlMatch[0];
-				resolve(url);
-			}
-		});
-
-		cloudflared.on("close", (code: any) => {
-			resolve(null);
-			// console.log(`Cloudflared tunnel process exited with code ${code}`);
-		});
-	});
-}
 
 // Start the server and the session ID refresh loop
 app.listen(port, async () => {
-	if (process.env.CLOUDFLARED === undefined) process.env.CLOUDFLARED = "true";
-	let cloudflared = process.env.CLOUDFLARED === "true";
-	let filePath: string;
-	let publicURL: string;
-	if (cloudflared) {
-		filePath = await DownloadCloudflared();
-		publicURL = await StartCloudflaredTunnel(filePath);
-	}
-
-	console.log(`💡 Server is running at http://localhost:${port}`);
-	console.log();
-	console.log(`🔗 Local Base URL: http://localhost:${port}/v1`);
-	console.log(`🔗 Local Endpoint: http://localhost:${port}/v1/chat/completions`);
-	console.log();
-	if (cloudflared && publicURL) console.log(`🔗 Public Base URL: ${publicURL}/v1`);
-	if (cloudflared && publicURL) console.log(`🔗 Public Endpoint: ${publicURL}/v1/chat/completions`);
-	else if (cloudflared && !publicURL) {
-		console.log("🔗 Public Endpoint: (Failed to start cloudflared tunnel, please restart the server.)");
-		if (filePath) fs.unlinkSync(filePath);
-	}
-	if (cloudflared && publicURL) console.log();
-	console.log("📝 Author: Pawan.Krd");
-	console.log(`🌐 Discord server: https://discord.gg/pawan`);
-	console.log("🌍 GitHub Repository: https://github.com/PawanOsman/ChatGPT");
-	console.log(`💖 Don't forget to star the repository if you like this project!`);
-	console.log();
-
 	setTimeout(async () => {
 		while (true) {
 			try {
 				await getNewSessionId();
 				await wait(refreshInterval);
 			} catch (error) {
+        console.error("Error...",error);
 				console.error("Error refreshing session ID, retrying in 2 minute...");
 				console.error("If this error persists, your country may not be supported yet.");
 				console.error("If your country was the issue, please consider using a U.S. VPN.");
